@@ -10,7 +10,7 @@ _run_ssh:
 	ssh $(CLAUDE) sh <<'EOSSH'
 	set -ex
 	cd ~/storage/Pictures/Photoprism
-	/tmp/cleanup 2018/01 2018/11
+	/tmp/cleanup 2018/01 2018/10
 	EOSSH
 
 run: _run_cp _run_ssh

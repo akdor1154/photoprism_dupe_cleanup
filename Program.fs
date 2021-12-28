@@ -56,9 +56,11 @@ let get_sets (files: File list) =
 
 type DupeDetails =
 	| JpgDupe of similarity:float
-	with 
-		static member toString (JpgDupe s) =
-			sprintf "%.2f" s
+	| Mp4Dupe of duration:TimeSpan * dateCreated:DateTime
+	with
+		static member toString d = match d with
+			| JpgDupe(s) -> sprintf "%.2f" s
+			| Mp4Dupe (s,t) -> sprintf "%A, %A" s t
 	end
 
 type Dupe = {
@@ -67,111 +69,98 @@ type Dupe = {
 	details: DupeDetails;
 }
 
-
-let get_dupes_jpg (files: File list) =
-	let hasher = CoenM.ImageHash.HashAlgorithms.PerceptualHash() in
-	let hashes =
+let get_dupes_base (identity: (File -> 'I)) (is_dupe: (('I * 'I) -> Option<DupeDetails>)) (files: File list) =
+	let identities =
 		files
-		|> List.map (fun f ->
-
-			printf "Hashing %s..." f.path;
-			use s = File.OpenRead(f.path) in
-			let hash = hasher.Hash(s) in
-			printfn "..done";
-			(f, hash)
+		|> Array.ofList
+		|> Array.Parallel.map (
+			fun f -> (f, (identity f))
 		)
-		in
-	let dupes = seq {
-		for (dupe_candidate, dupe_hash) in hashes do
-			let dupes_of = hashes |> List.choose (fun (other_candidate, other_hash) ->
-				if dupe_candidate = other_candidate then None
-				else
-					let similarity = CompareHash.Similarity(dupe_hash, other_hash) in
-					let dupe_size = dupe_candidate.size in
-					let other_size = other_candidate.size in
-					if similarity > 98.0 && dupe_size < other_size/4L then
-						Some {
-							Dupe.small_dupe = dupe_candidate;
-							other = other_candidate;
-							details = JpgDupe similarity;
-						}
-					else None
-			) in
-			match dupes_of with
-			|[d] -> Some(d)
-			|[] -> None
-			|many ->
-				let sims = many
-					|> Seq.map (fun d -> d.similarity)
-					|> Seq.map (sprintf "%.2f")
-					|> String.concat "," in
-				eprintfn "warning: got multiple dupe candidates for %s.\n%s" dupe_candidate.name sims;
-				None
-		done
-	}
-	|> Seq.choose (id)
+		|> List.ofArray
 	in
-	dupes
-;;
-
-let get_dupes (identity: (File -> 'I)) (is_dupe: (('I * 'I) -> Option<'D>)) (files: File list) =
-	let identities = files |> List.map (fun f ->
-		(f, (identity f))
-	) in
-	let dupes = seq {
-		for (dupe_candidate, dupe_hash) in identities do
+	let dupes =
+		identities
+		|> Seq.choose (fun (dupe_candidate, dupe_hash) ->
 			let dupes_of = identities |> List.choose (fun (other_candidate, other_hash) ->
 				if dupe_candidate = other_candidate then None
 				else
 					let dupe_details = is_dupe(dupe_hash, other_hash) in
 					let dupe_size = dupe_candidate.size in
 					let other_size = other_candidate.size in
-					if Some(d) = dupe_details && dupe_size < other_size/4L then
-						Some {
+					match dupe_details with
+					| Some(d) when dupe_size < other_size/2L ->	Some {
 							Dupe.small_dupe = dupe_candidate;
 							other = other_candidate;
 							details = d;
 						}
-					else None
+					| Some(d) when dupe_size < other_size ->
+						eprintfn "deets of \n\t%s and %s match but \n\t%d\n\t%d" dupe_candidate.name other_candidate.name dupe_size other_size;
+						None
+					| _ -> None
 			) in
 			match dupes_of with
 			|[d] -> Some(d)
 			|[] -> None
 			|many ->
-				let sims = many
-					|> Seq.map (fun d -> d.similarity)
-					|> Seq.map (sprintf "%.2f")
+				let desc = many
+					|> Seq.map (fun d -> DupeDetails.toString d.details)
 					|> String.concat "," in
-				eprintfn "warning: got multiple dupe candidates for %s.\n%s" dupe_candidate.name sims;
+				eprintfn "warning: got multiple dupe candidates for %s.\n%s" dupe_candidate.name desc;
 				None
-		done
-	}
+		)
 	in dupes
+;;
+
+let get_dupes_jpg =
+	let hasher = CoenM.ImageHash.HashAlgorithms.PerceptualHash() in
+	get_dupes_base (
+		fun f ->
+			eprintf "Hashing %s..." f.path;
+			use s = File.OpenRead(f.path) in
+			let hash = hasher.Hash(s) in
+			eprintfn "..done";
+			hash
+	) (
+		fun (dupe_hash, other_hash) ->
+			let similarity = CompareHash.Similarity(dupe_hash, other_hash) in
+			if similarity >= 98.0 then
+				Some(JpgDupe(similarity))
+			else None
+	)
+;;
+
+
+open MetadataExtractor
+open MetadataExtractor.Formats.QuickTime
 
 let As<'T> (x: Object): ('T option) =
 	if x :? 'T then
 		Some(x :?> 'T)
 		else None
 
-
-open MetadataExtractor
-open MetadataExtractor.Formats.QuickTime
-
-let get_dupes_mp4 (files: File list) =
-	let identities = files |> List.map (fun f ->
-		use stream = File.Open(f.path, FileMode.Open) in
-		let dirs = QuickTimeMetadataReader.ReadMetadata stream in
-		let qtmeta = dirs |> Seq.choose (As<QuickTimeFileTypeDirectory>) |> Seq.head in
-		let duration = qtmeta.GetDouble (QuickTimeMovieHeaderDirectory.TagDuration) in
-		let created = qtmeta.GetDateTime (QuickTimeMovieHeaderDirectory.TagCreated) in
-		(f, duration, created)
+let get_dupes_mp4 =
+	get_dupes_base (
+		fun f ->
+			use stream = File.Open(f.path, FileMode.Open) in
+			let dirs = QuickTimeMetadataReader.ReadMetadata stream in
+			let qtmeta = dirs |> Seq.choose (As<QuickTimeMovieHeaderDirectory>) |> Seq.head in
+			let duration = qtmeta.GetObject (QuickTimeMovieHeaderDirectory.TagDuration) :?> System.TimeSpan in
+			let created = qtmeta.GetDateTime (QuickTimeMovieHeaderDirectory.TagCreated) in
+			(duration, created)
+	) (
+		fun (dupe_hash, other_hash) ->
+			let dupe_duration, dupe_date = dupe_hash in
+			let other_duration, other_date = other_hash in
+			let duration_diff = dupe_duration - other_duration in
+			if Math.Abs(duration_diff.TotalSeconds) < 0.1 && dupe_date = other_date  then
+				Some(Mp4Dupe(dupe_duration, dupe_date))
+			else None
 	)
-	|> List.ofSeq;
-	Seq.empty
-
+;;
 
 let get_dupes (ext:string) (files: File list) =
 	match ext with
+	// | "jpg" -> get_dupes_jpg files
 	| "jpg" -> get_dupes_jpg files
 	| "mp4" -> get_dupes_mp4 files
 	| _ -> Seq.empty
@@ -212,7 +201,7 @@ let main argv =
 
 	Console.Error.Flush();
 	Console.Out.Flush();
-	
+
 	for d in dupes do
 		printfn "%s" d.small_dupe.path;
 		match d.small_dupe.sidecar with
