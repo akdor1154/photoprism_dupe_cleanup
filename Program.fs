@@ -38,6 +38,7 @@ let list_dir (dir:string) =
 			size = FileInfo(path).Length;
 			sidecar =
 				let sidecar_name = System.IO.Path.GetFileNameWithoutExtension(path) + ".json" in
+				let sidecar_path = System.IO.Path.Join(dir, sidecar_name) in
 				if File.Exists(sidecar_path) then Some(sidecar_path) else None
 		})
 		|> Seq.filter (fun f -> f.ext <> "json")
@@ -53,14 +54,21 @@ let get_sets (files: File list) =
 	|> List.map (fun ((ts, ext), files) -> (ext, files))
 ;;
 
+type DupeDetails =
+	| JpgDupe of similarity:float
+	with 
+		static member toString (JpgDupe s) =
+			sprintf "%.2f" s
+	end
+
 type Dupe = {
 	small_dupe: File;
 	other: File;
-	similarity: float;
+	details: DupeDetails;
 }
 
 
-let get_dupes_jpg (files: File List) =
+let get_dupes_jpg (files: File list) =
 	let hasher = CoenM.ImageHash.HashAlgorithms.PerceptualHash() in
 	let hashes =
 		files
@@ -84,9 +92,8 @@ let get_dupes_jpg (files: File List) =
 					if similarity > 98.0 && dupe_size < other_size/4L then
 						Some {
 							Dupe.small_dupe = dupe_candidate;
-
 							other = other_candidate;
-							similarity=similarity
+							details = JpgDupe similarity;
 						}
 					else None
 			) in
@@ -107,10 +114,66 @@ let get_dupes_jpg (files: File List) =
 	dupes
 ;;
 
+let get_dupes (identity: (File -> 'I)) (is_dupe: (('I * 'I) -> Option<'D>)) (files: File list) =
+	let identities = files |> List.map (fun f ->
+		(f, (identity f))
+	) in
+	let dupes = seq {
+		for (dupe_candidate, dupe_hash) in identities do
+			let dupes_of = identities |> List.choose (fun (other_candidate, other_hash) ->
+				if dupe_candidate = other_candidate then None
+				else
+					let dupe_details = is_dupe(dupe_hash, other_hash) in
+					let dupe_size = dupe_candidate.size in
+					let other_size = other_candidate.size in
+					if Some(d) = dupe_details && dupe_size < other_size/4L then
+						Some {
+							Dupe.small_dupe = dupe_candidate;
+							other = other_candidate;
+							details = d;
+						}
+					else None
+			) in
+			match dupes_of with
+			|[d] -> Some(d)
+			|[] -> None
+			|many ->
+				let sims = many
+					|> Seq.map (fun d -> d.similarity)
+					|> Seq.map (sprintf "%.2f")
+					|> String.concat "," in
+				eprintfn "warning: got multiple dupe candidates for %s.\n%s" dupe_candidate.name sims;
+				None
+		done
+	}
+	in dupes
+
+let As<'T> (x: Object): ('T option) =
+	if x :? 'T then
+		Some(x :?> 'T)
+		else None
+
+
+open MetadataExtractor
+open MetadataExtractor.Formats.QuickTime
+
+let get_dupes_mp4 (files: File list) =
+	let identities = files |> List.map (fun f ->
+		use stream = File.Open(f.path, FileMode.Open) in
+		let dirs = QuickTimeMetadataReader.ReadMetadata stream in
+		let qtmeta = dirs |> Seq.choose (As<QuickTimeFileTypeDirectory>) |> Seq.head in
+		let duration = qtmeta.GetDouble (QuickTimeMovieHeaderDirectory.TagDuration) in
+		let created = qtmeta.GetDateTime (QuickTimeMovieHeaderDirectory.TagCreated) in
+		(f, duration, created)
+	)
+	|> List.ofSeq;
+	Seq.empty
+
 
 let get_dupes (ext:string) (files: File list) =
 	match ext with
 	| "jpg" -> get_dupes_jpg files
+	| "mp4" -> get_dupes_mp4 files
 	| _ -> Seq.empty
 	// if ext is jpg:
 	// get hashes of all in set
@@ -146,8 +209,10 @@ let main argv =
 		eprintfn "\t%s, %.1fM, probs dupe of" d.small_dupe.name (MB d.small_dupe.size);
 		eprintfn "\t%s, %.1fM." d.other.name (MB d.other.size);
 	done;
+
 	Console.Error.Flush();
 	Console.Out.Flush();
+	
 	for d in dupes do
 		printfn "%s" d.small_dupe.path;
 		match d.small_dupe.sidecar with

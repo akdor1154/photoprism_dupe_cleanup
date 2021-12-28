@@ -7,7 +7,7 @@ CLAUDE:=claude-remote
 _run_cp: bin/cleanup
 	rsync -P bin/cleanup $(CLAUDE):/tmp/
 _run_ssh:
-	ssh claude-remote sh <<'EOSSH'
+	ssh $(CLAUDE) sh <<'EOSSH'
 	set -ex
 	cd ~/storage/Pictures/Photoprism
 	/tmp/cleanup 2018/01 2018/11
