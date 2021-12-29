@@ -22,6 +22,7 @@ type File = {
 
 let list_dir (dir:string) =
 	let pattern = Regex(@"^(?<ts>\d{8}_\d{6})_\w{8}\.(?<ext>\w+)$") in
+	let pattern = Regex(@"^(?<ts>[a-zA-Z0-9]+_\d+).*\.(?<ext>\w+)$") in
 	let files =
 		Directory.GetFiles(dir)
 		|> Seq.choose (fun path ->
@@ -51,7 +52,13 @@ let list_dir (dir:string) =
 let get_sets (files: File list) =
 	files
 	|> List.groupBy (fun f -> (f.ts, f.ext))
-	|> List.map (fun ((ts, ext), files) -> (ext, files))
+	|> List.map (fun ((ts, ext), files) ->
+		eprintfn "%s:" ts;
+		for f in files do
+			eprintfn "\t%s" f.name;
+		done;
+		(ext, files)
+	)
 ;;
 
 type DupeDetails =
@@ -69,14 +76,18 @@ type Dupe = {
 	details: DupeDetails;
 }
 
-let get_dupes_base (identity: (File -> 'I)) (is_dupe: (('I * 'I) -> Option<DupeDetails>)) (files: File list) =
+let get_dupes_base (identity: (File -> Option<'I>)) (is_dupe: (('I * 'I) -> Option<DupeDetails>)) (files: File list) =
 	let identities =
-		files
-		|> Array.ofList
-		|> Array.Parallel.map (
-			fun f -> (f, (identity f))
-		)
-		|> List.ofArray
+		match files with
+		| [f] -> []
+		| _ ->
+			files
+			|> List.choose (
+				fun f ->
+					match identity f with
+					| Some(id) -> Some (f, id)
+					| None -> None
+			)
 	in
 	let dupes =
 		identities
@@ -111,7 +122,7 @@ let get_dupes_base (identity: (File -> 'I)) (is_dupe: (('I * 'I) -> Option<DupeD
 	in dupes
 ;;
 
-let get_dupes_jpg =
+let get_dupes_jpg () =
 	let hasher = CoenM.ImageHash.HashAlgorithms.PerceptualHash() in
 	get_dupes_base (
 		fun f ->
@@ -119,7 +130,7 @@ let get_dupes_jpg =
 			use s = File.OpenRead(f.path) in
 			let hash = hasher.Hash(s) in
 			eprintfn "..done";
-			hash
+			Some hash
 	) (
 		fun (dupe_hash, other_hash) ->
 			let similarity = CompareHash.Similarity(dupe_hash, other_hash) in
@@ -143,10 +154,16 @@ let get_dupes_mp4 =
 		fun f ->
 			use stream = File.Open(f.path, FileMode.Open) in
 			let dirs = QuickTimeMetadataReader.ReadMetadata stream in
-			let qtmeta = dirs |> Seq.choose (As<QuickTimeMovieHeaderDirectory>) |> Seq.head in
-			let duration = qtmeta.GetObject (QuickTimeMovieHeaderDirectory.TagDuration) :?> System.TimeSpan in
-			let created = qtmeta.GetDateTime (QuickTimeMovieHeaderDirectory.TagCreated) in
-			(duration, created)
+			let qtmeta = dirs |> Seq.choose (As<QuickTimeMovieHeaderDirectory>) |> Seq.tryHead in
+			match qtmeta with
+			| None ->
+				eprintfn "Warning: no QtMovieHeaderDir in %s" f.name;
+				None
+			| Some(qtmeta) ->
+				let duration = qtmeta.GetObject (QuickTimeMovieHeaderDirectory.TagDuration) :?> System.TimeSpan in
+				let created = qtmeta.GetDateTime (QuickTimeMovieHeaderDirectory.TagCreated) in
+				Some (duration, created)
+
 	) (
 		fun (dupe_hash, other_hash) ->
 			let dupe_duration, dupe_date = dupe_hash in
@@ -159,9 +176,9 @@ let get_dupes_mp4 =
 ;;
 
 let get_dupes (ext:string) (files: File list) =
-	match ext with
+	match ext.ToLower() with
 	// | "jpg" -> get_dupes_jpg files
-	| "jpg" -> get_dupes_jpg files
+	| "jpg" -> get_dupes_jpg () files
 	| "mp4" -> get_dupes_mp4 files
 	| _ -> Seq.empty
 	// if ext is jpg:
